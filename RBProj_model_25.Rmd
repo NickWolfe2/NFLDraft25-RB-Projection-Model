@@ -1,0 +1,554 @@
+```{r}
+library(nflverse)
+library(tidyverse)
+library(ggplot2)
+library(cfbfastR)
+library(fuzzyjoin)
+library(rvest)
+library(randomForest)
+library(Metrics)
+library(tidytext)
+library(gt)
+library(gtExtras)
+library(grid)
+
+```
+
+
+
+```{r}
+#Loading and filtering draft data
+load_filtered_draft <- function(season) {
+  load_draft_picks(seasons = season) %>%
+    filter(position != '') %>%
+    mutate(season = season)
+}
+
+past_years <- 2015:2024
+past_drafts <- map_df(past_years, load_filtered_draft)
+
+```
+
+
+```{r}
+#Collecting the NFL stats of all drafted RBs
+
+draft <- load_draft_picks()
+
+drafted_rbs <- draft %>%
+  filter(position == "RB", season >= 2015) %>% mutate(
+    cfb_player_id = if_else(
+      is.na(cfb_player_id),
+      str_replace_all(str_to_lower(pfr_player_name), " ", "-"),
+      cfb_player_id
+    ))
+
+
+stats <- load_player_stats(seasons = c(2016:2024), stat_type = "offense") %>% filter(position == "RB", season_type == "REG") %>% select(-c(recent_team,week,opponent_team,season_type)) %>% group_by(player_id, player_name, player_display_name, position_group, headshot_url, season) %>% 
+  summarise(across(where(is.numeric), sum, na.rm = TRUE), .groups = "drop")
+
+rb_first_3 <- stats %>%
+  group_by(player_id) %>%
+  arrange(season) %>%
+  slice_head(n = 3) %>%
+  mutate(season = row_number()) %>%
+  ungroup() %>% rename(gsis_id = player_id)
+
+
+
+
+rb_wide <- rb_first_3 %>%
+  select(gsis_id:headshot_url, where(is.numeric)) %>%
+  pivot_wider(
+    names_from = season,
+    values_from = where(is.numeric),
+    names_sep = "_"
+  )
+
+drafted_rbs_with_stats <- drafted_rbs %>%
+  left_join(rb_wide, by = c("gsis_id")) %>% select(-c(player_name:headshot_url)) %>% 
+  group_by(season, round, pick, team, gsis_id, pfr_player_id, pfr_player_name, college) %>% 
+  summarise(across(where(is.numeric), sum, na.rm = TRUE), .groups = "drop") %>% 
+  select(-c(pass_completions:pass_ints, to, allpro:dr_av, def_solo_tackles:def_sacks, attempts_1:dakota_3, completions_1:completions_3)) %>% 
+  rename_with(.fn = ~ paste0("college_", .), .cols = 9:16)
+
+
+```
+
+
+
+
+
+
+```{r}
+#looking at SRS for teams to assign relative team values for players
+#This would help assess in the model if the player's success is related to their team's success (SRS Score)
+#I.E. is a Alabama or Georgia RB actually good? or are they just on a stacked team?
+
+srs_all_years <- map_dfr(2014:2025, ~ cfbd_ratings_srs(year = .x))%>%
+  mutate( team = str_replace(team, "San José State", "San Jose State"),
+          team = str_replace(team, "\\bState\\b", "St."), 
+          team = if_else(team == "Miami", "Miami (FL)", team),
+          year = year + 1)
+
+
+
+#Manually had to fill in missing data
+
+
+drafted_rbs_with_stats_srs <- drafted_rbs_with_stats %>%
+  left_join(srs_all_years, by = c("college" = "team", "season" = "year")) %>% 
+  select(-c(division, ranking)) %>% mutate(
+    college = ifelse(college == "Boston Col.", "Boston College", college)
+  ) %>% 
+  relocate("rating", .before = "college_age") %>% mutate(
+    rating = case_when(
+      college == "Texas-El Paso" & season == 2018 ~ -11.4,     # UTEP
+      college == "Mississippi" & season == 2019 ~ 1.0,         # Ole Miss
+      college == "Mississippi" & season == 2024 ~ 14.3,        # Ole Miss
+      college == "Mississippi" & season == 2023 ~ 12.5,        # Ole Miss
+      college == "Appalachian St." & season == 2020 ~ 9.5,     # App State
+      college == "North Carolina St." & season == 2018 ~ 10.1, # NC St.
+      college == "North Carolina St." & season == 2019 ~ 6.8,  # NC St.
+      college == "Ala-Birmingham" & season == 2024 ~ -14.3,    #UAB
+      college == "Miami (FL)" & season == 2021 ~ 6.56, #Miami
+      college == "Boston College" & season == 2021 ~ -0.04,
+      college == "Florida St." & season == 2021 ~ -6.6,
+      college == "Memphis" & season == 2021 ~ -1.29,
+      college == "Navy" & season == 2021 ~ -10.08,
+      college == "New Mexico St." & season == 2021 ~ -27.68,
+      college == "Arizona St." & season == 2021 ~ 1.75,
+      college == "UCLA" & season == 2021 ~ -0.11,
+      college == "Utah" & season == 2021 ~ 0.67,
+      college == "Appalachian St." & season == 2021 ~ 5.47,
+      college == "Central Florida" & season == 2025 ~ 6.2,
+      college == "Clemson" & season == 2021 ~ 16.82,
+      college == "North Carolina" & season == 2021 ~ 7.03,
+      college == "Arizona" & season == 2021 ~ -14.08,
+      college == "Virginia Tech" & season == 2021 ~ 1.51,
+      college == "Cinncinati" & season == 2021 ~ 14.92,
+      
+      TRUE ~ rating
+    )
+  ) %>% 
+  select(season:team, pfr_player_name:rating, rushing_yards_1:rushing_yards_3, receiving_yards_1:receiving_yards_3) %>% 
+  mutate(missing_rating = is.na(rating),
+         rating = rating) %>% 
+  relocate(missing_rating, .after = rating)
+
+
+```
+
+
+
+
+
+
+#Gathering PFF Stats and Base Stats for college
+
+```{r}
+
+#Data Accessed from PFF, using a paid-PFF Plus account - Private data, and is illegal to redistribute on GitHub
+
+folder_path <- "rushing sums"
+
+# List all CSVs in folder
+csv_files <- list.files(path = folder_path, pattern = "\\.csv$", full.names = TRUE)
+
+# Load each file, add season from filename
+rushing_data <- csv_files %>%
+  lapply(function(file) {
+    df <- read_csv(file)
+    
+    # Extract last two digits and convert to year
+    season_year <- str_extract(file, "\\d{2}(?=\\.csv$)")
+    season <- as.numeric(season_year) + 2000
+    
+    df <- df %>% mutate(season = season)
+    return(df)
+  }) %>%
+  bind_rows()
+
+
+
+rb_names_pff <- drafted_rbs_with_stats_srs %>%
+  select(season, pfr_player_name) %>%
+  distinct()
+
+rb_names_realpff <- rushing_data %>% 
+  select(season, player) %>% 
+  distinct()
+
+
+rb_names_realpff_clean <- rb_names_realpff %>%
+  filter(player != "Drake Johnson")
+
+# Step 1: Fuzzy join on player name only
+fuzzy_matches <- stringdist_left_join(
+  rb_names_realpff_clean,
+  rb_names_pff,
+  by = c("player" = "pfr_player_name"),
+  method = "jw",
+  max_dist = 0.15,
+  distance_col = "dist"
+) %>%
+  filter(season.x < season.y) %>%
+  rename(season_college = season.x, season_draft = season.y)
+
+# Step 2: Keep lowest-distance match(es) per draft name
+best_matches <- fuzzy_matches %>%
+  group_by(pfr_player_name) %>%
+  filter(dist == min(dist, na.rm = TRUE)) %>%
+  ungroup()
+
+
+pff_cleaned <- rushing_data %>%
+  filter(player %in% unique(best_matches$player)) %>% 
+  select(player:attempts, touchdowns, rec_yards, rush_yards = yards, yco_attempt:yprr, season) %>% 
+  left_join(best_matches %>% select(-dist), by = c("player" = "player", "season" = "season_college")) %>% 
+  relocate(season:pfr_player_name, .before = player) %>% 
+  filter(position %in% c("HB", "FB"))
+
+#I did min player_id because I looked at the data, and the correct player always had a smaller player_id 
+pff_cleaned_fixed <- pff_cleaned %>%
+  group_by(player) %>%
+  filter(player_id == min(player_id)) %>%
+  ungroup() %>% 
+  select(-c(ypa, touchdowns, position, team_name))
+
+pff_pivoted <- pff_cleaned_fixed %>% 
+  group_by(season_draft, pfr_player_name, player, player_id) %>%
+  arrange(desc(season)) %>%
+  slice_head(n = 2) %>%
+  mutate(season_label = if_else(row_number() == 1, "yr2", "yr1")) %>%
+  ungroup() %>%
+
+  # Pivot longer on all stat columns except identifying info
+  pivot_longer(
+    cols = -c(season_draft, pfr_player_name, player, player_id, season_label),
+    names_to = "stat",
+    values_to = "value"
+  ) %>%
+
+  # Create combined stat name with _yr1/_yr2 suffix
+  mutate(stat = paste0(stat, "_", season_label)) %>%
+
+  # Pivot wider to get desired structure
+  select(-season_label) %>%
+  pivot_wider(names_from = stat, values_from = value)
+
+ 
+```
+
+
+
+#actually switch it up. use RAS (Relative Athletic Score) using a RAS Missing binary flag to incorporate those dudes that were scared of being measured
+
+```{r}
+#RAS Scores found on RAS Website, publically available at the time of access
+
+RAS_scores <- read_csv("RB Draft History RAS.csv") %>% 
+  select(-c(Link, Alltime)) %>% 
+   mutate(
+    RAS_missing = is.na(RAS),
+    RAS = RAS,  # leave RAS as NA
+    Name = case_when(
+      Name == "Cameron Skattebo" ~ "Cam Skattebo",
+      Name == "Matt Dayes" ~ "Matthew Dayes",
+      Name == "Re'Mahn Davis" ~ "Ray Davis",
+      TRUE ~ Name
+    )
+  )
+
+RAS_fuzzy_matches <- stringdist_left_join(
+  RAS_scores,
+  rb_names_pff,
+  by = c("Name" = "pfr_player_name", "Year" = "season"),
+  method = "jw",
+  max_dist = 0.15,
+  distance_col = "dist"
+) %>% 
+  select(pfr_player_name, Year:RAS_missing) %>% 
+  filter(!(is.na(pfr_player_name)))
+  
+
+
+```
+
+
+```{r}
+final_RB_data <- pff_pivoted %>% 
+  left_join(RAS_fuzzy_matches %>% select(-College), by = c("season_draft" = "Year", "pfr_player_name")) %>% 
+  left_join(drafted_rbs_with_stats_srs, by = c("pfr_player_name", "season_draft" = "season")) %>%
+  relocate(round:college, .after = season_draft) %>% 
+  select(-player) %>% 
+  filter(season_draft > 2015) %>% 
+  rename_with(~ str_replace_all(., "_yr1$", "_NCAA1")) %>%
+  rename_with(~ str_replace_all(., "_yr2$", "_NCAA2")) %>%
+  rename_with(~ str_replace_all(., "_1$", "_NFL1")) %>%
+  rename_with(~ str_replace_all(., "_2$", "_NFL2")) %>%
+  rename_with(~ str_replace_all(., "_3$", "_NFL3")) %>% 
+  select(-c(player_id, season_NCAA1, season_NCAA2))
+
+```
+
+
+What I have:
+
+-PFF College Stats
+-NFL First 3 years Stats
+-Measurements
+-SRS
+
+What Else do I need?:
+
+- seperate college stats by last 2 years (this means probably cutting out 2015 draft, as they would only have 1 yr of ncaa stats)
+- join into 1 df
+-detail and define plan for model. what am I predicting? whats the plan after the model? 
+-run model
+
+
+
+
+updated plan. due to GPT reccommendations (that I should know given I just took SAL313...) I will be doing a random forest instead
+
+
+```{r}
+#RANDOM FOREST MODELS
+
+# --- 0. Replace NAs in feature columns with 0 ---
+non_feature_cols <- c(
+  "pfr_player_name", "season_draft", "round", "pick",
+  "team", "college", "receiving_yards_NFL1", "receiving_yards_NFL2", "receiving_yards_NFL3",
+  "rushing_yards_NFL1", "rushing_yards_NFL2", "rushing_yards_NFL3"
+)
+
+final_RB_data <- final_RB_data %>%
+  mutate(across(-all_of(non_feature_cols), ~ replace_na(.x, 0)))
+
+# --- 1. Split the data by draft season ---
+train_data <- final_RB_data %>% filter(season_draft < 2023)
+test_data  <- final_RB_data %>% filter(season_draft == 2024)
+pred_data  <- final_RB_data %>% filter(season_draft == 2025)
+
+# --- 2. Define NFL targets ---
+target_cols <- c("receiving_yards_NFL1", "receiving_yards_NFL2", "receiving_yards_NFL3",
+                 "rushing_yards_NFL1", "rushing_yards_NFL2", "rushing_yards_NFL3")
+
+# --- 3. Define features (everything not an identifier or NFL output) ---
+exclude_cols <- c(
+  target_cols,
+  "pfr_player_name", "player_id", "season_draft", "round", "pick",
+  "team", "college")
+
+# --- 4. Final feature set ---
+feature_cols <- setdiff(names(train_data), exclude_cols)
+
+X_train <- train_data[, feature_cols]
+X_test  <- test_data[, feature_cols]
+X_pred  <- pred_data[, feature_cols]
+
+Y_train <- train_data[, target_cols]
+Y_test  <- test_data[, target_cols]
+
+# --- 5. Store predictions ---
+pred_test <- data.frame(matrix(nrow = nrow(X_test), ncol = 0))
+pred_2025 <- data.frame(matrix(nrow = nrow(X_pred), ncol = 0))
+
+# --- RECEIVING MODELS ---
+rf_rec1 <- randomForest(x = X_train, y = Y_train$receiving_yards_NFL1,
+                        ntree = 1000, nodesize = 1, mtry = floor(ncol(X_train) * 0.85))
+pred_test$receiving_yards_NFL1 <- predict(rf_rec1, X_test)
+pred_2025$receiving_yards_NFL1 <- predict(rf_rec1, X_pred)
+
+X_train_rec2 <- X_train %>% mutate(receiving_yards_NFL1 = Y_train$receiving_yards_NFL1)
+X_test_rec2  <- X_test %>% mutate(receiving_yards_NFL1 = pred_test$receiving_yards_NFL1)
+X_pred_rec2  <- X_pred %>% mutate(receiving_yards_NFL1 = pred_2025$receiving_yards_NFL1)
+
+rf_rec2 <- randomForest(x = X_train_rec2, y = Y_train$receiving_yards_NFL2,
+                        ntree = 1000, nodesize = 1, mtry = floor(ncol(X_train_rec2) * 0.85))
+pred_test$receiving_yards_NFL2 <- predict(rf_rec2, X_test_rec2)
+pred_2025$receiving_yards_NFL2 <- predict(rf_rec2, X_pred_rec2)
+
+X_train_rec3 <- X_train_rec2 %>% mutate(receiving_yards_NFL2 = Y_train$receiving_yards_NFL2)
+X_test_rec3  <- X_test_rec2 %>% mutate(receiving_yards_NFL2 = pred_test$receiving_yards_NFL2)
+X_pred_rec3  <- X_pred_rec2 %>% mutate(receiving_yards_NFL2 = pred_2025$receiving_yards_NFL2)
+
+rf_rec3 <- randomForest(x = X_train_rec3, y = Y_train$receiving_yards_NFL3,
+                        ntree = 1000, nodesize = 1, mtry = floor(ncol(X_train_rec3) * 0.85))
+pred_test$receiving_yards_NFL3 <- predict(rf_rec3, X_test_rec3)
+pred_2025$receiving_yards_NFL3 <- predict(rf_rec3, X_pred_rec3)
+
+# --- RUSHING MODELS ---
+
+rf_rush1 <- randomForest(x = X_train, y = Y_train$rushing_yards_NFL1,
+                         ntree = 1000, nodesize = 1, mtry = floor(ncol(X_train) * 0.85))
+pred_test$rushing_yards_NFL1 <- predict(rf_rush1, X_test)
+pred_2025$rushing_yards_NFL1 <- predict(rf_rush1, X_pred)
+
+X_train_rush2 <- X_train %>% mutate(rushing_yards_NFL1 = Y_train$rushing_yards_NFL1)
+X_test_rush2  <- X_test %>% mutate(rushing_yards_NFL1 = pred_test$rushing_yards_NFL1)
+X_pred_rush2  <- X_pred %>% mutate(rushing_yards_NFL1 = pred_2025$rushing_yards_NFL1)
+
+rf_rush2 <- randomForest(x = X_train_rush2, y = Y_train$rushing_yards_NFL2,
+                         ntree = 1000, nodesize = 1, mtry = floor(ncol(X_train_rush2) * 0.85))
+pred_test$rushing_yards_NFL2 <- predict(rf_rush2, X_test_rush2)
+pred_2025$rushing_yards_NFL2 <- predict(rf_rush2, X_pred_rush2)
+
+X_train_rush3 <- X_train_rush2 %>% mutate(rushing_yards_NFL2 = Y_train$rushing_yards_NFL2)
+X_test_rush3  <- X_test_rush2 %>% mutate(rushing_yards_NFL2 = pred_test$rushing_yards_NFL2)
+X_pred_rush3  <- X_pred_rush2 %>% mutate(rushing_yards_NFL2 = pred_2025$rushing_yards_NFL2)
+
+rf_rush3 <- randomForest(x = X_train_rush3, y = Y_train$rushing_yards_NFL3,
+                         ntree = 1000, nodesize = 1, mtry = floor(ncol(X_train_rush3) * 0.85))
+pred_test$rushing_yards_NFL3 <- predict(rf_rush3, X_test_rush3)
+pred_2025$rushing_yards_NFL3 <- predict(rf_rush3, X_pred_rush3)
+
+
+```
+
+
+
+```{r}
+
+pred_test <- pred_test %>%
+  rename_with(~ paste0("pred_", .x))
+
+# Join player name + truth + predictions
+results_test <- test_data %>%
+  select(pfr_player_name) %>%
+  bind_cols(Y_test, pred_test)
+
+# Compute RMSE for each NFL stat
+rmse_table <- tibble(
+  metric = c("receiving_yards_NFL1", "receiving_yards_NFL2", "receiving_yards_NFL3",
+             "rushing_yards_NFL1", "rushing_yards_NFL2", "rushing_yards_NFL3"),
+  RMSE = map_dbl(metric, ~ rmse(results_test[[.x]], results_test[[paste0("pred_", .x)]]))
+)
+
+print(rmse_table)
+
+# Baseline RMSE using a naive mean model
+mean_model_rmse <- rmse(
+  Y_test$receiving_yards_NFL1,
+  rep(mean(Y_train$receiving_yards_NFL1), nrow(Y_test))
+)
+
+
+results_2025 <- pred_data %>% 
+  select(team, pfr_player_name) %>% 
+  bind_cols(pred_2025) %>% 
+  mutate(total_yards_NFL1 = receiving_yards_NFL1 + rushing_yards_NFL1,
+         total_yards_NFL2 = receiving_yards_NFL2 + rushing_yards_NFL2,
+         total_yards_NFL3 = receiving_yards_NFL3 + rushing_yards_NFL3,
+         ) %>%
+  mutate(across(where(is.numeric), ~ round(.x, 1)))
+
+```
+
+
+```{r}
+
+ggplot(results_test, aes(x = receiving_yards_NFL1, y = pred_receiving_yards_NFL1)) +
+  geom_point() +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "blue") +
+  labs(title = "Receiving Yards NFL1: Predicted vs Actual",
+       x = "Actual", y = "Predicted")
+
+# Rushing Yards NFL1
+ggplot(results_test, aes(x = rushing_yards_NFL1, y = pred_rushing_yards_NFL1)) +
+  geom_point() +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "darkgreen") +
+  labs(title = "Rushing Yards NFL1: Predicted vs Actual",
+       x = "Actual", y = "Predicted")
+
+# --- 2. Player-level error summary (absolute error) ---
+player_errors <- results_test %>%
+  mutate(
+    abs_error_rec1 = abs(receiving_yards_NFL1 - pred_receiving_yards_NFL1),
+    abs_error_rush1 = abs(rushing_yards_NFL1 - pred_rushing_yards_NFL1)
+  ) %>%
+  arrange(desc(abs_error_rec1 + abs_error_rush1))  # sort by total NFL1 error
+
+# View top players by prediction error
+player_errors %>%
+  select(pfr_player_name,
+         receiving_yards_NFL1, pred_receiving_yards_NFL1, abs_error_rec1,
+         rushing_yards_NFL1, pred_rushing_yards_NFL1, abs_error_rush1) %>%
+  head(10)
+
+```
+
+
+
+```{r}
+importance_rec <- importance(rf_rec1) %>%
+  as.data.frame() %>%
+  rownames_to_column(var = "feature") %>%
+  arrange(desc(IncNodePurity))
+
+importance_rec %>%
+  ggplot(aes(x = reorder(feature, IncNodePurity), y = IncNodePurity)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  labs(
+    title = "Feature Importance – Receiving Yards NFL1",
+    x = "Feature",
+    y = "Increase in Node Purity"
+  ) +
+  theme_minimal()
+
+
+importance_rush <- importance(rf_rush1) %>%
+  as.data.frame() %>%
+  rownames_to_column(var = "feature") %>%
+  arrange(desc(IncNodePurity))
+
+importance_rush %>%
+  ggplot(aes(x = reorder(feature, IncNodePurity), y = IncNodePurity)) +
+  geom_col(fill = "darkgreen") +
+  coord_flip() +
+  labs(
+    title = "Feature Importance – Rushing Yards NFL1",
+    x = "Feature",
+    y = "Increase in Node Purity"
+  ) +
+  theme_minimal()
+
+```
+```{r}
+
+importance_rec <- importance(rf_rec1) %>%
+  as.data.frame() %>%
+  rownames_to_column(var = "feature") %>%
+  mutate(model = "Receiving Yards NFL1")
+
+importance_rush <- importance(rf_rush1) %>%
+  as.data.frame() %>%
+  rownames_to_column(var = "feature") %>%
+  mutate(model = "Rushing Yards NFL1")
+
+# Combine and select top 15 features from each
+importance_combined <- bind_rows(importance_rec, importance_rush) %>%
+  group_by(model) %>%
+  ungroup()
+
+importance_combined %>%
+  group_by(model) %>%
+  ungroup() %>%
+  ggplot(aes(x = reorder_within(feature, IncNodePurity, model), y = IncNodePurity, fill = model)) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~ model, scales = "free") +
+  coord_flip() +
+  scale_x_reordered() +
+  labs(
+    title = "Feature Importance for Receiving vs Rushing Yards NFL1",
+    x = "Feature",
+    y = "Increase in Node Purity"
+  ) +
+  theme_minimal()
+
+
+
+```
+
